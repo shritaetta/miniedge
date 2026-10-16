@@ -136,13 +136,8 @@ Measures error rates and goodput when offered load (10 to 60 ops/sec) exceeds a 
 
 ## Known Limitations
 
-*(Copied from DESIGN.md §9)*
-
 - Single-process simulation; no real network partitions.
 - Lock service is a single point of failure.
 - Lease expiry relies on `time.monotonic()` within one process; real systems must handle clock skew between machines.
 - Fixed-size chunking with no deduplication or compression.
 - LRU is vulnerable to scan pollution.
-- **Multi-chunk writes are not atomic:** Puts are applied chunk-by-chunk to the object store. If a write spanning multiple chunks fails midway (e.g. put #2 of 4 raises, process crash, or lease expiry), the chunks written prior to failure remain committed in the backend store, while subsequent chunks and `#meta` are not written. Readers after failure observe partially committed files unless an external transaction or manifest log rollback is implemented.
-- **Retries can outlast the TTL:** Exponential backoff retries in `retry_with_backoff` during backend operations may sleep longer than the remaining lease TTL. If the lease expires while retrying, subsequent puts are rejected by fencing or the lease check. `EdgeNode` checks `locks.is_valid(lease)` inside the retry loop before each put attempt to fail fast with `LeaseExpired`.
-- **Per-client state growth:** The client read-version map (`_client_read_versions`) and per-client rate limiters (`PerClientLimiter`) retain state keyed by `(client_id, key)` and `client_id`. Clients that read without writing, or clients that disconnect without cleanup, lead to unbounded dictionary memory growth unless an explicit LRU/TTL eviction or session-pruning mechanism is added.
