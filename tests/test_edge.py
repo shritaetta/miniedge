@@ -568,3 +568,170 @@ def test_meta_and_chunks_invalidated_on_fencing_token_bump() -> None:
     read_back = node1.read("c1", "meta_bump.txt", 0, 50)
     assert read_back == extended_data
 
+
+def test_write_back_crash_before_flush_loses_data() -> None:
+    """Demonstrate that write-back mode loses un-flushed volatile data on crash,
+
+    while calling flush() persists data across restarts.
+    """
+    store = ObjectStore()
+    locks = LockService(default_ttl=5.0)
+    limiter_b = TokenBucket(capacity=1000, refill_rate=1000)
+    limiter_c = PerClientLimiter(capacity=1000, refill_rate=1000)
+
+    # 1. Node 1 runs in write-back mode with flusher thread disabled (flush_interval=0)
+    node1 = EdgeNode(
+        node_id="node_1",
+        store=store,
+        locks=locks,
+        backend_limiter=limiter_b,
+        client_limiter=limiter_c,
+        write_back=True,
+        flush_interval=0,
+    )
+
+    # Write data: cache updated locally, but backend ObjectStore is NOT touched
+    node1.write("client_1", "/volatile.txt", 0, b"uncommitted_payload")
+
+    # Local read hits cache immediately ("local speed")
+    assert node1.read("client_1", "/volatile.txt", 0, 19) == b"uncommitted_payload"
+
+    # Backend store has NOT received chunk or metadata yet
+    with pytest.raises(KeyError):
+        store.get("/volatile.txt#0")
+    with pytest.raises(KeyError):
+        store.get("/volatile.txt#meta")
+
+    # 2. Simulate node crash: node1 is discarded/abandoned without calling flush() or close()
+    del node1
+
+    # 3. Node 2 starts up (representing restarted node or another edge node reading from store)
+    node2 = EdgeNode(
+        node_id="node_2",
+        store=store,
+        locks=locks,
+        backend_limiter=limiter_b,
+        client_limiter=limiter_c,
+        write_back=True,
+        flush_interval=0,
+    )
+
+    # Read from restarted node: un-flushed data was lost in the crash, returns empty
+    assert node2.read("client_2", "/volatile.txt", 0, 19) == b""
+
+    # 4. Demonstrate that calling flush() persists data and survives node restart
+    node3 = EdgeNode(
+        node_id="node_3",
+        store=store,
+        locks=locks,
+        backend_limiter=limiter_b,
+        client_limiter=limiter_c,
+        write_back=True,
+        flush_interval=0,
+    )
+    node3.write("client_3", "/durable.txt", 0, b"persisted_payload")
+    # Explicit flush commits dirty chunks and #meta to store under fencing token and CAS
+    node3.flush()
+
+    # Verify data exists in store now
+    assert store.get("/durable.txt#0")[0] == b"persisted_payload"
+    assert store.get("/durable.txt#meta")[0] == str(len(b"persisted_payload")).encode("utf-8")
+
+    # Node 3 is discarded (crash or shutdown)
+    del node3
+
+    # Node 4 reads from store: persisted data is intact
+    node4 = EdgeNode(
+        node_id="node_4",
+        store=store,
+        locks=locks,
+        backend_limiter=limiter_b,
+        client_limiter=limiter_c,
+    )
+    assert node4.read("client_4", "/durable.txt", 0, 17) == b"persisted_payload"
+
+
+def test_write_back_eviction_flushes_dirty_chunks() -> None:
+    """Dirty chunks evicted from the cache due to LRU capacity constraints are flushed to store first."""
+    store = ObjectStore()
+    locks = LockService(default_ttl=5.0)
+    limiter_b = TokenBucket(capacity=1000, refill_rate=1000)
+    limiter_c = PerClientLimiter(capacity=1000, refill_rate=1000)
+
+    # Cache capacity is 2 items, chunk size is 10 bytes
+    node = EdgeNode(
+        node_id="node_evict",
+        store=store,
+        locks=locks,
+        chunk_size=10,
+        cache_capacity=2,
+        backend_limiter=limiter_b,
+        client_limiter=limiter_c,
+        write_back=True,
+        flush_interval=0,
+    )
+
+    # Write chunk 0: cache holds "/evict.bin#meta" and "/evict.bin#0" (2 entries, cache full)
+    node.write("c1", "/evict.bin", 0, b"0123456789")
+    with pytest.raises(KeyError):
+        store.get("/evict.bin#0")
+
+    # Write chunk 1: adds "/evict.bin#1", evicting the least-recently used dirty entry
+    node.write("c1", "/evict.bin", 10, b"abcdefghij")
+
+    # The evicted dirty chunk MUST have been flushed to ObjectStore by on_evict_dirty
+    evicted_data, evicted_ver = store.get("/evict.bin#0")
+    assert evicted_data == b"0123456789"
+    assert evicted_ver >= 1
+
+
+def test_write_back_background_flusher_and_close() -> None:
+    """Background flusher thread periodically flushes dirty data, and close() stops it cleanly."""
+    store = ObjectStore()
+    locks = LockService(default_ttl=5.0)
+    limiter_b = TokenBucket(capacity=1000, refill_rate=1000)
+    limiter_c = PerClientLimiter(capacity=1000, refill_rate=1000)
+    clock = FakeClock(initial_time=100.0)
+
+    node = EdgeNode(
+        node_id="node_flusher",
+        store=store,
+        locks=locks,
+        backend_limiter=limiter_b,
+        client_limiter=limiter_c,
+        clock=clock,
+        write_back=True,
+        flush_interval=1.0,
+    )
+
+    try:
+        # Write dirty chunk
+        node.write("c1", "/bg.txt", 0, b"background_data")
+
+        # Before flush interval: store has no data
+        with pytest.raises(KeyError):
+            store.get("/bg.txt#0")
+
+        # Advance simulated clock past flush interval (1.0s)
+        clock.advance(1.5)
+
+        # Allow background flusher thread to execute flush
+        flushed = False
+        for _ in range(100):
+            try:
+                if store.get("/bg.txt#0")[0] == b"background_data":
+                    flushed = True
+                    break
+            except KeyError:
+                pass
+            time.sleep(0.02)
+
+        assert flushed, "Background flusher thread did not flush /bg.txt#0 in time"
+        assert store.get("/bg.txt#meta")[0] == str(len(b"background_data")).encode("utf-8")
+    finally:
+        node.close()
+
+    # Flusher thread is stopped and joined
+    assert node._flusher_thread is None or not node._flusher_thread.is_alive()
+
+

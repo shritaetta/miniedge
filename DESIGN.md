@@ -136,6 +136,17 @@ Optional extension: **write-back** (write to the cache, mark dirty, flush asynch
 | Durability | Durable on return | Data loss if node crashes before flush |
 | Complexity | Low | Dirty tracking, flush ordering, crash recovery |
 
+**Write-Back Implementation & Flusher Mechanics:**
+- **Write Path:** When `write_back=True`, `write()` modifies the in-memory `ChunkCache` and marks chunk and metadata entries `dirty=True`. It captures the original version in `_dirty_chunks` for eventual CAS validation. Crucially, it returns immediately **without touching the backend** (no store calls, no backend rate limiter token consumption).
+- **Background Flusher & Close:** A dedicated background thread periodically wakes up every `flush_interval` (using the injectable clock) to call `flush()`. Calling `close()` signals the flusher thread to terminate, joins the thread, and executes a final synchronous `flush()`.
+- **Flush Ordering & Fencing:** `flush(path)` acquires an exclusive lease from `LockService` to obtain a fresh `fencing_token`. It commits dirty chunk payloads to `ObjectStore` first via CAS (`expected_version`) and fencing. Only after all chunks successfully commit does it commit the updated file length to `#meta`. Once verified on backend, cached entries transition to clean (`dirty=False`).
+- **Dirty Eviction Pre-Flush:** If cache capacity is reached, `ChunkCache` invokes `on_evict_dirty` before evicting a dirty entry. The node acquires an exclusive lease and synchronously writes the evicted chunk to `ObjectStore`, guaranteeing dirty data is never dropped on LRU churn.
+
+**What is lost if the node crashes before a flush:**
+- **Volatile Dirty Data Loss:** Any dirty chunk payload and metadata modifications currently held only in volatile memory (`_cache` and `_dirty_chunks`) that have not yet been written via `flush()`, background flusher, or LRU eviction hook are **permanently lost**.
+- **Backend Consistency:** The `ObjectStore` retains the exact state from the last successful flush. Other nodes or a newly spawned edge node reading from `ObjectStore` will observe old/unmodified data (or missing file records if never previously flushed).
+- **File Length Integrity:** Because `#meta` is strictly written to `ObjectStore` *after* all constituent chunks have been written, a crash never leaves `#meta` pointing past data that failed to reach the store. The file boundary remains consistent with persisted chunks.
+
 ## 6. Failure scenarios and expected behavior **[YOU]**
 
 | Scenario | Expected behavior | Mechanism |
